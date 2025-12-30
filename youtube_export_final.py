@@ -1,7 +1,11 @@
 """
 YouTube Studio 批量导出工具 - 最终版
-解决 YouTube 每次最多导出12条的限制
-通过多次导出 + 滚动/翻页 + 合并去重
+解决 YouTube 每次只能导出12个视频的 Chart Data 限制
+
+导出的 ZIP 包含：
+- Table data.csv  → 全部视频（用第一次）
+- Chart data.csv  → 只有当前12个视频（需要拼接）
+- Totals.csv      → 总计（用第一次）
 """
 
 import asyncio
@@ -18,7 +22,6 @@ try:
 except ImportError:
     print("正在安装 playwright...")
     os.system(f"{sys.executable} -m pip install playwright")
-    os.system(f"{sys.executable} -m playwright install chromium")
     from playwright.async_api import async_playwright, Page
 
 
@@ -26,7 +29,7 @@ except ImportError:
 CHROME_DEBUG_PORT = 9222
 OUTPUT_DIR = "youtube_exports"
 DOWNLOADS_DIR = os.path.join(OUTPUT_DIR, "downloads")
-MAX_EXPORT_ROUNDS = 50  # 最多导出轮数，防止无限循环
+MAX_EXPORT_ROUNDS = 50
 # ==============================================
 
 
@@ -80,49 +83,72 @@ class YouTubeExporter:
             print("   ✅ 已到达内容分析页面")
     
     async def get_video_count(self) -> int:
-        """获取页面上显示的视频总数"""
-        # 尝试从页面上找到总数显示
-        count = await self.page.evaluate("""
+        """获取视频总数 - 从页面上的 '1-12 / 56' 或 '1–12 / 56' 格式提取"""
+        result = await self.page.evaluate("""
             () => {
-                // 查找显示总数的元素，如 "1-12 / 56"
-                const texts = document.body.innerText;
-                const match = texts.match(/\\d+\\s*[-–]\\s*\\d+\\s*\\/\\s*(\\d+)/);
-                if (match) return parseInt(match[1]);
+                // 多种可能的格式:
+                // 中文: "1-12 / 56", "1–12 / 56" (en-dash)
+                // 英文: "1-12 of 56", "1–12 of 56"
+                // 可能有空格变化
                 
-                // 备选：计算表格行数
-                const rows = document.querySelectorAll('ytcp-video-row, [class*="entity-row"]');
-                return rows.length;
-            }
-        """)
-        return count or 0
-    
-    async def scroll_table_down(self):
-        """滚动表格区域，加载下一批数据"""
-        await self.page.evaluate("""
-            () => {
-                // 找到表格容器并滚动
-                const containers = [
-                    document.querySelector('ytcp-entity-page'),
-                    document.querySelector('.style-scope.ytcp-analytics-video-table'),
-                    document.querySelector('main'),
-                    document.documentElement
+                const patterns = [
+                    /(\d+)\s*[-–]\s*(\d+)\s*\/\s*(\d+)/,      // "1-12 / 56"
+                    /(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)/i,     // "1-12 of 56"
+                    /(\d+)\s*[-–]\s*(\d+)\s*共\s*(\d+)/,      // "1-12 共 56"
+                    /共\s*(\d+)\s*个/,                         // "共 56 个"
+                    /(\d+)\s+videos?/i,                        // "56 videos"
                 ];
-                for (const c of containers) {
-                    if (c && c.scrollHeight > c.clientHeight) {
-                        c.scrollTop = c.scrollHeight;
+                
+                const texts = document.body.innerText;
+                
+                for (const pattern of patterns) {
+                    const match = texts.match(pattern);
+                    if (match) {
+                        // 返回最后一个捕获组（总数）
+                        const total = match[match.length - 1];
+                        const num = parseInt(total);
+                        if (num > 0 && num < 100000) {
+                            console.log('Found video count:', num, 'with pattern:', pattern.toString());
+                            return { count: num, pattern: pattern.toString(), matched: match[0] };
+                        }
                     }
                 }
-                window.scrollTo(0, document.body.scrollHeight);
+                
+                // 备选：尝试从分页区域查找
+                const paginationEl = document.querySelector(
+                    '[class*="pagination"], [class*="page-info"], ' +
+                    'ytcp-table-footer, .table-footer, [class*="entity-page"]'
+                );
+                if (paginationEl) {
+                    const pText = paginationEl.innerText;
+                    for (const pattern of patterns) {
+                        const match = pText.match(pattern);
+                        if (match) {
+                            const total = match[match.length - 1];
+                            const num = parseInt(total);
+                            if (num > 0) {
+                                return { count: num, pattern: 'pagination-' + pattern.toString(), matched: match[0] };
+                            }
+                        }
+                    }
+                }
+                
+                return { count: 0, pattern: 'none', matched: '' };
             }
         """)
-        await asyncio.sleep(1)
+        
+        if result and result.get('count', 0) > 0:
+            print(f"   📊 检测到视频数量: {result['count']} (匹配: '{result.get('matched', '')}')")
+            return result['count']
+        else:
+            print(f"   ⚠️ 未能自动检测视频数量，将持续导出直到没有下一页")
+            return 0
     
     async def click_next_page(self) -> bool:
-        """尝试点击下一页按钮"""
+        """点击下一页"""
         next_btn = await self.page.query_selector(
-            '[aria-label*="下一页"], [aria-label*="Next"], '
-            'button:has-text("下一页"), button:has-text("Next"), '
-            '[icon="chevron_right"], .pagination-next'
+            '[aria-label*="下一页"], [aria-label*="Next page"], '
+            '[aria-label*="next"], [icon="chevron_right"]'
         )
         
         if next_btn:
@@ -137,7 +163,7 @@ class YouTubeExporter:
         return False
     
     async def export_once(self) -> str:
-        """执行一次导出，返回下载的文件路径"""
+        """执行一次导出"""
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         
         # 找导出按钮
@@ -156,7 +182,6 @@ class YouTubeExporter:
         if not export_btn:
             return None
         
-        # 点击导出按钮
         await export_btn.click()
         await asyncio.sleep(1)
         
@@ -184,32 +209,31 @@ class YouTubeExporter:
             await self.page.keyboard.press("Escape")
             return None
         
-        # 点击下载
         try:
             async with self.page.expect_download(timeout=30000) as download_info:
                 await csv_option.click()
             
             download = await download_info.value
             filename = download.suggested_filename
-            filepath = os.path.join(DOWNLOADS_DIR, f"{datetime.now().strftime('%H%M%S')}_{filename}")
+            filepath = os.path.join(DOWNLOADS_DIR, f"{self.exported_count:03d}_{filename}")
             await download.save_as(filepath)
+            self.exported_count += 1
             return filepath
             
         except Exception as e:
             print(f"   下载出错: {e}")
             return None
     
-    async def export_all(self):
+    async def export_all(self) -> list:
         """循环导出所有数据"""
         print("\n📌 开始批量导出...")
         
         total_videos = await self.get_video_count()
-        print(f"   检测到约 {total_videos} 个视频")
+        print(f"   检测到 {total_videos} 个视频")
         
         if total_videos > 12:
-            print(f"   需要多次导出（每次最多12条）")
             estimated_rounds = (total_videos + 11) // 12
-            print(f"   预计需要 {estimated_rounds} 轮导出")
+            print(f"   需要 {estimated_rounds} 轮导出 Chart Data")
         
         downloaded_files = []
         
@@ -220,29 +244,21 @@ class YouTubeExporter:
             
             if filepath:
                 downloaded_files.append(filepath)
-                self.exported_count += 1
-                print(f"✅ 成功")
+                print(f"✅")
             else:
                 print(f"❌ 失败")
                 break
             
-            # 尝试翻页或滚动到下一批
+            # 翻页
             has_next = await self.click_next_page()
             
             if not has_next:
-                # 没有下一页按钮，尝试滚动
-                await self.scroll_table_down()
-                await asyncio.sleep(1)
-                
-                # 检查是否还有更多数据
-                new_count = await self.get_video_count()
-                if new_count <= total_videos and round_num * 12 >= total_videos:
-                    print(f"\n   ✅ 已导出所有数据")
-                    break
+                print(f"\n   ✅ 没有更多页了")
+                break
             
             await asyncio.sleep(1)
         
-        print(f"\n   📊 共完成 {self.exported_count} 轮导出")
+        print(f"\n   📊 共完成 {len(downloaded_files)} 轮导出")
         return downloaded_files
     
     async def close(self):
@@ -250,103 +266,110 @@ class YouTubeExporter:
             await self.playwright.stop()
 
 
-def extract_and_merge(download_dir: str = DOWNLOADS_DIR) -> str:
-    """解压并合并所有下载的文件，去重"""
-    print("\n📌 合并所有导出文件...")
+def merge_exports(download_dir: str = DOWNLOADS_DIR) -> dict:
+    """
+    合并导出文件
+    - Table data: 用第一个
+    - Totals: 用第一个  
+    - Chart data: 拼接所有
+    """
+    print("\n📌 合并导出文件...")
     
     if not os.path.exists(download_dir):
         print("   没有下载文件")
         return None
     
-    all_rows = []
-    fieldnames = None
-    file_count = 0
+    table_data = None
+    totals_data = None
+    chart_data_rows = []
+    chart_fieldnames = None
     
-    for filename in sorted(os.listdir(download_dir)):
-        filepath = os.path.join(download_dir, filename)
-        
-        if filename.endswith('.zip'):
-            file_count += 1
-            try:
-                with zipfile.ZipFile(filepath, 'r') as zf:
-                    for name in zf.namelist():
-                        if '表格' in name or 'Table' in name:
-                            with zf.open(name) as f:
-                                content = f.read().decode('utf-8-sig')
-                                lines = content.strip().split('\n')
-                                reader = csv.DictReader(lines)
-                                
-                                if not fieldnames:
-                                    fieldnames = reader.fieldnames
-                                
-                                for row in reader:
-                                    first_val = list(row.values())[0] if row else ""
-                                    if first_val.lower() not in ['total', '总计', '合计']:
-                                        all_rows.append(dict(row))
-            except Exception as e:
-                print(f"   ⚠️ 处理 {filename} 出错: {e}")
-        
-        elif filename.endswith('.csv') and not filename.startswith('youtube_all'):
-            file_count += 1
-            try:
-                with open(filepath, 'r', encoding='utf-8-sig') as f:
-                    reader = csv.DictReader(f)
-                    if not fieldnames:
-                        fieldnames = reader.fieldnames
-                    for row in reader:
-                        first_val = list(row.values())[0] if row else ""
-                        if first_val.lower() not in ['total', '总计', '合计']:
-                            all_rows.append(dict(row))
-            except Exception as e:
-                print(f"   ⚠️ 处理 {filename} 出错: {e}")
+    zip_files = sorted([f for f in os.listdir(download_dir) if f.endswith('.zip')])
     
-    print(f"   处理了 {file_count} 个文件，共 {len(all_rows)} 行原始数据")
-    
-    if not all_rows or not fieldnames:
-        print("   没有数据可合并")
+    if not zip_files:
+        print("   没有找到 ZIP 文件")
         return None
     
-    # 去重
-    seen = set()
-    unique_rows = []
+    print(f"   找到 {len(zip_files)} 个 ZIP 文件")
     
-    # 找到用于去重的列（视频标题或 ID）
-    id_col = None
-    for col in ['Content', '内容', 'Video title', '视频标题', 'video_id']:
-        if col in fieldnames:
-            id_col = col
-            break
-    
-    for row in all_rows:
-        if id_col:
-            key = row.get(id_col, '')
-        else:
-            key = str(sorted(row.items()))
+    for i, filename in enumerate(zip_files):
+        filepath = os.path.join(download_dir, filename)
+        is_first = (i == 0)
         
-        if key and key not in seen:
-            seen.add(key)
-            unique_rows.append(row)
+        try:
+            with zipfile.ZipFile(filepath, 'r') as zf:
+                for name in zf.namelist():
+                    with zf.open(name) as f:
+                        content = f.read().decode('utf-8-sig')
+                        lines = content.strip().split('\n')
+                        
+                        # Table data - 只用第一个
+                        if ('表格' in name or 'Table' in name) and is_first:
+                            table_data = content
+                            print(f"   ✅ Table data（来自第1个ZIP）")
+                        
+                        # Totals - 只用第一个
+                        elif ('总计' in name or 'Totals' in name) and is_first:
+                            totals_data = content
+                            print(f"   ✅ Totals（来自第1个ZIP）")
+                        
+                        # Chart data - 拼接所有
+                        elif '图表' in name or 'Chart' in name:
+                            reader = csv.DictReader(lines)
+                            if not chart_fieldnames:
+                                chart_fieldnames = reader.fieldnames
+                            
+                            row_count = 0
+                            for row in reader:
+                                chart_data_rows.append(dict(row))
+                                row_count += 1
+                            
+                            print(f"   📊 Chart data 第{i+1}批: +{row_count} 行")
+                            
+        except Exception as e:
+            print(f"   ⚠️ 处理 {filename} 出错: {e}")
     
-    # 保存
+    # 保存结果
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(OUTPUT_DIR, f"youtube_all_videos_{timestamp}.csv")
+    output_subdir = os.path.join(OUTPUT_DIR, f"merged_{timestamp}")
+    os.makedirs(output_subdir, exist_ok=True)
     
-    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(unique_rows)
+    result = {}
+    
+    # 保存 Table data
+    if table_data:
+        path = os.path.join(output_subdir, "Table data.csv")
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            f.write(table_data)
+        result['table'] = path
+    
+    # 保存 Totals
+    if totals_data:
+        path = os.path.join(output_subdir, "Totals.csv")
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            f.write(totals_data)
+        result['totals'] = path
+    
+    # 保存合并后的 Chart data
+    if chart_data_rows and chart_fieldnames:
+        path = os.path.join(output_subdir, "Chart data.csv")
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=chart_fieldnames)
+            writer.writeheader()
+            writer.writerows(chart_data_rows)
+        result['chart'] = path
     
     print(f"\n   ✅ 合并完成!")
-    print(f"   📁 文件: {output_path}")
-    print(f"   📊 共 {len(unique_rows)} 条记录（去重后）")
+    print(f"   📁 输出目录: {output_subdir}")
+    print(f"   📊 Chart data 共 {len(chart_data_rows)} 行")
     
-    return output_path
+    return result
 
 
 async def main():
     print("\n" + "=" * 60)
     print("   📊 YouTube Studio 批量导出工具")
-    print("   解决每次最多导出12条的限制")
+    print("   解决 Chart Data 每次只能导出12个视频的限制")
     print("=" * 60)
     
     exporter = YouTubeExporter()
@@ -365,15 +388,15 @@ async def main():
         print("📋 请在 Chrome 中:")
         print("   1. 确认已在 '分析 > 内容' 页面")
         print("   2. 设置好时间范围")
-        print("   3. 脚本会自动多次导出并合并")
+        print("   3. 确保视频列表从第1页开始")
         print("-" * 60)
         input("\n准备好后按 Enter 开始...")
         
         # 批量导出
         await exporter.export_all()
         
-        # 合并所有文件
-        extract_and_merge()
+        # 合并文件
+        merge_exports()
     
     finally:
         await exporter.close()
