@@ -1,0 +1,8 @@
+# 敏感文件
+chrome_debug_profile/
+youtube_exports/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
