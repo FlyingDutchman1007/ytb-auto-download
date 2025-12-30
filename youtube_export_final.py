@@ -1,21 +1,26 @@
 """
-YouTube Studio 批量导出工具 - 最终版
-解决 YouTube 每次只能导出12个视频的 Chart Data 限制
+YouTube Studio 批量导出工具
+解决 YouTube 每次最多只能勾选 12 个视频导出的限制
 
-导出的 ZIP 包含：
-- Table data.csv  → 全部视频（用第一次）
-- Chart data.csv  → 只有当前12个视频（需要拼接）
-- Totals.csv      → 总计（用第一次）
+使用方法：
+1. 运行 start_chrome.bat 启动 Chrome
+2. 打开 YouTube Studio > 分析 > 内容 > 高级模式
+3. 设置好时间范围和筛选条件
+4. 运行此脚本
+
+导出逻辑：
+- 每次勾选最多 12 个视频 → 导出 → 取消勾选 → 滚动 → 重复
+- Table data: 用第一次（包含所有视频汇总）
+- Chart data: 拼接所有（每批视频的详细数据）
+- Totals: 用第一次
 """
 
 import asyncio
 import csv
 import os
-import re
 import sys
 import zipfile
 from datetime import datetime
-from pathlib import Path
 
 try:
     from playwright.async_api import async_playwright, Page
@@ -29,7 +34,8 @@ except ImportError:
 CHROME_DEBUG_PORT = 9222
 OUTPUT_DIR = "youtube_exports"
 DOWNLOADS_DIR = os.path.join(OUTPUT_DIR, "downloads")
-MAX_EXPORT_ROUNDS = 50
+MAX_VIDEOS_PER_EXPORT = 12
+MAX_EXPORT_ROUNDS = 100
 # ==============================================
 
 
@@ -39,6 +45,7 @@ class YouTubeExporter:
         self.playwright = None
         self.browser = None
         self.exported_count = 0
+        self.exported_videos = set()  # 记录已导出的视频（用文本标识）
         
     async def connect(self) -> bool:
         """连接到已打开的 Chrome"""
@@ -51,167 +58,245 @@ class YouTubeExporter:
             )
             
             contexts = self.browser.contexts
-            if not contexts:
+            if not contexts or not contexts[0].pages:
+                print("   ❌ 没有找到打开的页面")
                 return False
             
+            # 找 YouTube Studio 页面
             for page in contexts[0].pages:
                 if "studio.youtube.com" in page.url:
                     self.page = page
-                    print(f"   ✅ 已连接: {page.url[:60]}...")
+                    print(f"   ✅ 已连接: {page.url[:70]}...")
                     return True
             
-            if contexts[0].pages:
-                self.page = contexts[0].pages[0]
-                return True
-                
-            return False
+            # 用第一个页面
+            self.page = contexts[0].pages[0]
+            print(f"   ✅ 已连接: {self.page.url[:70]}...")
+            return True
             
         except Exception as e:
             print(f"   ❌ 连接失败: {e}")
+            print("   请确保已运行 start_chrome.bat")
             return False
     
-    async def goto_content_analytics(self):
-        """导航到内容分析页面"""
-        print("\n📌 导航到内容分析页面...")
-        
-        match = re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', self.page.url)
-        if match:
-            channel_id = match.group(1)
-            url = f"https://studio.youtube.com/channel/{channel_id}/analytics/tab-content/period-default"
-            await self.page.goto(url, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
-            print("   ✅ 已到达内容分析页面")
+    async def get_video_checkboxes(self) -> list:
+        """获取所有视频的复选框"""
+        checkboxes = await self.page.evaluate(r'''() => {
+            const results = [];
+            
+            // 找 role=checkbox 的元素
+            const allCheckboxes = document.querySelectorAll("[role='checkbox']");
+            
+            for (const cb of allCheckboxes) {
+                const rect = cb.getBoundingClientRect();
+                
+                // 跳过不可见的
+                if (rect.width === 0 || rect.height === 0) continue;
+                
+                // 向上找包含文本的父元素
+                let row = cb;
+                let text = "";
+                for (let i = 0; i < 10 && row; i++) {
+                    row = row.parentElement;
+                    if (row && row.innerText && row.innerText.length > 10) {
+                        text = row.innerText;
+                        break;
+                    }
+                }
+                
+                // 跳过"合计"行
+                if (text.includes("合计") || text.includes("Total") || text.includes("总计")) {
+                    continue;
+                }
+                
+                // 跳过没有视频信息的行（视频行会有时长如 2:31）
+                if (!text.match(/\d:\d\d/)) {
+                    continue;
+                }
+                
+                // 检查是否选中
+                const isChecked = cb.getAttribute("aria-checked") === "true";
+                
+                results.push({
+                    x: rect.x + rect.width / 2,
+                    y: rect.y + rect.height / 2,
+                    checked: isChecked,
+                    text: text.substring(0, 50).replace(/\n/g, " ")
+                });
+            }
+            
+            return results;
+        }''')
+        return checkboxes or []
     
-    async def get_video_count(self) -> int:
-        """获取视频总数 - 从页面上的 '1-12 / 56' 或 '1–12 / 56' 格式提取"""
-        result = await self.page.evaluate("""
+    async def count_checked(self) -> int:
+        """计算当前勾选的视频数量"""
+        checkboxes = await self.get_video_checkboxes()
+        return sum(1 for cb in checkboxes if cb['checked'])
+    
+    async def select_videos(self, max_count: int = 12) -> int:
+        """勾选视频复选框，返回勾选数量"""
+        checkboxes = await self.get_video_checkboxes()
+        
+        if not checkboxes:
+            print("   ⚠️ 未找到视频复选框")
+            return 0
+        
+        print(f"   📋 找到 {len(checkboxes)} 个可见视频")
+        
+        # 筛选未勾选的
+        unchecked = [cb for cb in checkboxes if not cb['checked']]
+        
+        if not unchecked:
+            print("   ℹ️ 当前可见视频都已勾选")
+            return 0
+        
+        # 勾选前 max_count 个
+        to_select = unchecked[:max_count]
+        selected_count = 0
+        
+        for cb in to_select:
+            try:
+                await self.page.mouse.click(cb['x'], cb['y'])
+                await asyncio.sleep(0.3)
+                selected_count += 1
+            except Exception as e:
+                print(f"   ⚠️ 勾选失败: {e}")
+        
+        # 验证勾选结果
+        await asyncio.sleep(0.5)
+        actual_checked = await self.count_checked()
+        print(f"   ✅ 当前已勾选: {actual_checked} 个视频")
+        
+        return selected_count
+    
+    async def unselect_all(self):
+        """取消所有勾选"""
+        for _ in range(3):  # 最多尝试3轮
+            checkboxes = await self.get_video_checkboxes()
+            checked = [cb for cb in checkboxes if cb['checked']]
+            
+            if not checked:
+                break
+            
+            for cb in checked:
+                try:
+                    await self.page.mouse.click(cb['x'], cb['y'])
+                    await asyncio.sleep(0.2)
+                except:
+                    pass
+            
+            await asyncio.sleep(0.3)
+    
+    async def scroll_down(self) -> bool:
+        """向下滚动表格区域，返回是否有新内容"""
+        old_checkboxes = await self.get_video_checkboxes()
+        old_count = len(old_checkboxes)
+        
+        await self.page.evaluate("""
             () => {
-                // 多种可能的格式:
-                // 中文: "1-12 / 56", "1–12 / 56" (en-dash)
-                // 英文: "1-12 of 56", "1–12 of 56"
-                // 可能有空格变化
-                
-                const patterns = [
-                    /(\d+)\s*[-–]\s*(\d+)\s*\/\s*(\d+)/,      // "1-12 / 56"
-                    /(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)/i,     // "1-12 of 56"
-                    /(\d+)\s*[-–]\s*(\d+)\s*共\s*(\d+)/,      // "1-12 共 56"
-                    /共\s*(\d+)\s*个/,                         // "共 56 个"
-                    /(\d+)\s+videos?/i,                        // "56 videos"
-                ];
-                
-                const texts = document.body.innerText;
-                
-                for (const pattern of patterns) {
-                    const match = texts.match(pattern);
-                    if (match) {
-                        // 返回最后一个捕获组（总数）
-                        const total = match[match.length - 1];
-                        const num = parseInt(total);
-                        if (num > 0 && num < 100000) {
-                            console.log('Found video count:', num, 'with pattern:', pattern.toString());
-                            return { count: num, pattern: pattern.toString(), matched: match[0] };
-                        }
-                    }
-                }
-                
-                // 备选：尝试从分页区域查找
-                const paginationEl = document.querySelector(
-                    '[class*="pagination"], [class*="page-info"], ' +
-                    'ytcp-table-footer, .table-footer, [class*="entity-page"]'
+                // 找表格容器并滚动
+                const scrollables = document.querySelectorAll(
+                    '[class*="table-body"], [class*="scroll"], ' +
+                    '[style*="overflow"], main, [class*="content"]'
                 );
-                if (paginationEl) {
-                    const pText = paginationEl.innerText;
-                    for (const pattern of patterns) {
-                        const match = pText.match(pattern);
-                        if (match) {
-                            const total = match[match.length - 1];
-                            const num = parseInt(total);
-                            if (num > 0) {
-                                return { count: num, pattern: 'pagination-' + pattern.toString(), matched: match[0] };
-                            }
+                for (const el of scrollables) {
+                    if (el.scrollHeight > el.clientHeight) {
+                        el.scrollBy(0, 400);
+                    }
+                }
+                window.scrollBy(0, 400);
+            }
+        """)
+        await asyncio.sleep(1.5)
+        
+        new_checkboxes = await self.get_video_checkboxes()
+        new_count = len(new_checkboxes)
+        
+        return new_count != old_count
+    
+    async def click_export_button(self) -> bool:
+        """点击导出按钮"""
+        export_btn = await self.page.evaluate_handle("""
+            () => {
+                // 方法1: aria-label 包含导出
+                const labels = ['导出当前视图', 'Export current view', '导出', 'Export'];
+                for (const label of labels) {
+                    const btns = document.querySelectorAll(`[aria-label*="${label}"]`);
+                    for (const btn of btns) {
+                        const rect = btn.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return btn;
                         }
                     }
                 }
                 
-                return { count: 0, pattern: 'none', matched: '' };
+                // 方法2: 下载图标按钮
+                const downloadBtns = document.querySelectorAll('[icon*="download"], [icon*="export"]');
+                for (const btn of downloadBtns) {
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return btn;
+                    }
+                }
+                
+                return null;
             }
         """)
         
-        if result and result.get('count', 0) > 0:
-            print(f"   📊 检测到视频数量: {result['count']} (匹配: '{result.get('matched', '')}')")
-            return result['count']
-        else:
-            print(f"   ⚠️ 未能自动检测视频数量，将持续导出直到没有下一页")
-            return 0
-    
-    async def click_next_page(self) -> bool:
-        """点击下一页"""
-        next_btn = await self.page.query_selector(
-            '[aria-label*="下一页"], [aria-label*="Next page"], '
-            '[aria-label*="next"], [icon="chevron_right"]'
-        )
-        
-        if next_btn:
-            is_disabled = await next_btn.get_attribute("disabled")
-            aria_disabled = await next_btn.get_attribute("aria-disabled")
-            
-            if not is_disabled and aria_disabled != "true":
-                await next_btn.click()
-                await asyncio.sleep(2)
-                return True
-        
-        return False
-    
-    async def export_once(self) -> str:
-        """执行一次导出"""
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-        
-        # 找导出按钮
-        export_btn = await self.page.query_selector('[aria-label*="导出"], [aria-label*="Export"]')
         if not export_btn:
-            export_btn = await self.page.evaluate_handle("""
-                () => {
-                    for (const btn of document.querySelectorAll('button, ytcp-button')) {
-                        const text = (btn.textContent + (btn.getAttribute('aria-label') || '')).toLowerCase();
-                        if (text.includes('导出') || text.includes('export')) return btn;
-                    }
-                    return null;
-                }
-            """)
-        
-        if not export_btn:
-            return None
+            print("   ❌ 未找到导出按钮")
+            return False
         
         await export_btn.click()
         await asyncio.sleep(1)
+        return True
+    
+    async def click_csv_option(self) -> bool:
+        """点击 CSV 下载选项"""
+        await asyncio.sleep(0.5)
         
-        # 找 CSV 选项
-        csv_option = await self.page.query_selector(
-            '[role="menuitem"]:has-text("CSV"), '
-            '[role="menuitem"]:has-text("导出当前视图"), '
-            '[role="menuitem"]:has-text("Export current view")'
-        )
-        
-        if not csv_option:
-            csv_option = await self.page.evaluate_handle("""
-                () => {
-                    for (const item of document.querySelectorAll('[role="menuitem"], tp-yt-paper-item')) {
-                        const text = item.textContent.toLowerCase();
-                        if (text.includes('csv') || text.includes('导出') || text.includes('export')) {
+        csv_option = await self.page.evaluate_handle("""
+            () => {
+                // 查找菜单项
+                const items = document.querySelectorAll(
+                    '[role="menuitem"], tp-yt-paper-item, paper-item, ' +
+                    '[class*="menu-item"], [class*="dropdown-item"]'
+                );
+                for (const item of items) {
+                    const text = (item.textContent || '').toLowerCase();
+                    const rect = item.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        if (text.includes('csv') || 
+                            text.includes('导出当前视图') || 
+                            text.includes('export current view')) {
                             return item;
                         }
                     }
-                    return null;
                 }
-            """)
+                return null;
+            }
+        """)
         
         if not csv_option:
             await self.page.keyboard.press("Escape")
+            print("   ❌ 未找到 CSV 选项")
+            return False
+        
+        await csv_option.click()
+        return True
+    
+    async def export_once(self) -> str:
+        """执行一次导出，返回文件路径"""
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        
+        if not await self.click_export_button():
             return None
         
         try:
             async with self.page.expect_download(timeout=30000) as download_info:
-                await csv_option.click()
+                if not await self.click_csv_option():
+                    return None
             
             download = await download_info.value
             filename = download.suggested_filename
@@ -221,44 +306,105 @@ class YouTubeExporter:
             return filepath
             
         except Exception as e:
-            print(f"   下载出错: {e}")
+            print(f"   ❌ 下载失败: {e}")
+            await self.page.keyboard.press("Escape")
             return None
     
     async def export_all(self) -> list:
-        """循环导出所有数据"""
-        print("\n📌 开始批量导出...")
-        
-        total_videos = await self.get_video_count()
-        print(f"   检测到 {total_videos} 个视频")
-        
-        if total_videos > 12:
-            estimated_rounds = (total_videos + 11) // 12
-            print(f"   需要 {estimated_rounds} 轮导出 Chart Data")
+        """批量导出所有视频"""
+        print("\n" + "=" * 55)
+        print("   📊 开始批量导出")
+        print("=" * 55)
         
         downloaded_files = []
+        round_num = 0
+        no_progress_count = 0
         
-        for round_num in range(1, MAX_EXPORT_ROUNDS + 1):
-            print(f"\n   📥 第 {round_num} 轮导出...", end=" ")
+        while round_num < MAX_EXPORT_ROUNDS:
+            round_num += 1
+            print(f"\n{'─' * 55}")
+            print(f"📥 第 {round_num} 轮")
+            print(f"{'─' * 55}")
             
+            # 1. 先取消所有勾选
+            print("   🔄 取消已有勾选...")
+            await self.unselect_all()
+            await asyncio.sleep(0.5)
+            
+            # 2. 获取当前可见的视频复选框
+            checkboxes = await self.get_video_checkboxes()
+            print(f"   📋 当前可见 {len(checkboxes)} 个视频")
+            
+            # 3. 筛选出未导出过的视频（用文本标识判断）
+            not_exported = []
+            for cb in checkboxes:
+                video_id = cb['text'].strip()[:30]  # 用前30字符作为标识
+                if video_id and video_id not in self.exported_videos:
+                    not_exported.append(cb)
+            
+            print(f"   📋 其中 {len(not_exported)} 个未导出")
+            
+            if not not_exported:
+                # 尝试滚动加载更多
+                print("   📜 滚动查找更多视频...")
+                await self.scroll_down()
+                await asyncio.sleep(1)
+                
+                checkboxes = await self.get_video_checkboxes()
+                not_exported = []
+                for cb in checkboxes:
+                    video_id = cb['text'].strip()[:30]
+                    if video_id and video_id not in self.exported_videos:
+                        not_exported.append(cb)
+                
+            if not not_exported:
+                # 滚动后还是没有新视频，直接结束
+                print("\n   ✅ 所有视频都已导出完成！")
+                break
+            
+            no_progress_count = 0
+            
+            # 4. 勾选这批视频（最多12个）
+            to_select = not_exported[:MAX_VIDEOS_PER_EXPORT]
+            selected_count = 0
+            selected_ids = []
+            
+            print(f"   ☑️ 勾选 {len(to_select)} 个视频...")
+            for cb in to_select:
+                try:
+                    await self.page.mouse.click(cb['x'], cb['y'])
+                    await asyncio.sleep(0.3)
+                    selected_count += 1
+                    selected_ids.append(cb['text'].strip()[:30])
+                except Exception as e:
+                    print(f"   ⚠️ 勾选失败: {e}")
+            
+            print(f"   ✅ 已勾选 {selected_count} 个视频")
+            
+            if selected_count == 0:
+                continue
+            
+            # 5. 导出
+            print("   📤 导出中...")
             filepath = await self.export_once()
             
             if filepath:
                 downloaded_files.append(filepath)
-                print(f"✅")
+                print(f"   ✅ 下载成功: {os.path.basename(filepath)}")
+                # 记录这批已导出的视频
+                for vid in selected_ids:
+                    self.exported_videos.add(vid)
+                print(f"   📊 累计已导出 {len(self.exported_videos)} 个视频")
             else:
-                print(f"❌ 失败")
-                break
-            
-            # 翻页
-            has_next = await self.click_next_page()
-            
-            if not has_next:
-                print(f"\n   ✅ 没有更多页了")
-                break
+                print(f"   ❌ 导出失败")
             
             await asyncio.sleep(1)
         
-        print(f"\n   📊 共完成 {len(downloaded_files)} 轮导出")
+        print(f"\n{'=' * 55}")
+        print(f"   📊 完成！共导出 {len(downloaded_files)} 个文件")
+        print(f"   📊 覆盖 {len(self.exported_videos)} 个视频")
+        print(f"{'=' * 55}")
+        
         return downloaded_files
     
     async def close(self):
@@ -269,9 +415,9 @@ class YouTubeExporter:
 def merge_exports(download_dir: str = DOWNLOADS_DIR) -> dict:
     """
     合并导出文件
-    - Table data: 用第一个
+    - Table data: 用第一个（已包含所有视频汇总）
     - Totals: 用第一个  
-    - Chart data: 拼接所有
+    - Chart data: 拼接所有（每批视频的详细时间序列数据）
     """
     print("\n📌 合并导出文件...")
     
@@ -367,10 +513,10 @@ def merge_exports(download_dir: str = DOWNLOADS_DIR) -> dict:
 
 
 async def main():
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 55)
     print("   📊 YouTube Studio 批量导出工具")
-    print("   解决 Chart Data 每次只能导出12个视频的限制")
-    print("=" * 60)
+    print("   解决每次最多勾选 12 个视频的限制")
+    print("=" * 55)
     
     exporter = YouTubeExporter()
     
@@ -378,19 +524,27 @@ async def main():
         if not await exporter.connect():
             print("\n❌ 无法连接 Chrome")
             print("   1. 运行 start_chrome.bat 启动 Chrome")
-            print("   2. 登录 YouTube Studio")
-            print("   3. 重新运行此脚本")
+            print("   2. 打开 YouTube Studio")
+            print("   3. 进入 分析 > 内容 > 高级模式")
+            print("   4. 设置好时间范围和筛选条件")
+            print("   5. 重新运行此脚本")
             return
         
-        await exporter.goto_content_analytics()
-        
-        print("\n" + "-" * 60)
-        print("📋 请在 Chrome 中:")
-        print("   1. 确认已在 '分析 > 内容' 页面")
-        print("   2. 设置好时间范围")
-        print("   3. 确保视频列表从第1页开始")
-        print("-" * 60)
+        print("\n" + "-" * 55)
+        print("📋 请确认：")
+        print("   1. 已在 YouTube Studio 高级模式")
+        print("   2. 已设置好时间范围和筛选条件")
+        print("   3. 可以看到视频列表和前面的复选框")
+        print("-" * 55)
         input("\n准备好后按 Enter 开始...")
+        
+        # 清空旧的下载
+        if os.path.exists(DOWNLOADS_DIR):
+            for f in os.listdir(DOWNLOADS_DIR):
+                try:
+                    os.remove(os.path.join(DOWNLOADS_DIR, f))
+                except:
+                    pass
         
         # 批量导出
         await exporter.export_all()
@@ -401,9 +555,9 @@ async def main():
     finally:
         await exporter.close()
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 55)
     print("   ✅ 完成!")
-    print("=" * 60 + "\n")
+    print("=" * 55 + "\n")
 
 
 if __name__ == "__main__":
