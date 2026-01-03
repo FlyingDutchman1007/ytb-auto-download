@@ -39,6 +39,29 @@ MAX_EXPORT_ROUNDS = 100
 # ==============================================
 
 
+def get_videos_from_zip(filepath: str) -> list:
+    """从 ZIP 文件中读取 Chart data，返回视频名字列表"""
+    try:
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            for name in zf.namelist():
+                if 'Chart' in name or 'chart' in name:
+                    with zf.open(name) as f:
+                        content = f.read().decode('utf-8-sig')
+                        reader = csv.DictReader(content.strip().split('\n'))
+                        # 找到视频标题列
+                        video_titles = set()
+                        for row in reader:
+                            # 尝试不同的列名
+                            for col in ['视频标题', 'Video title', '视频', 'Video', 'Content']:
+                                if col in row and row[col]:
+                                    video_titles.add(row[col])
+                                    break
+                        return list(video_titles)
+    except Exception as e:
+        print(f"      读取 ZIP 失败: {e}")
+    return []
+
+
 class YouTubeExporter:
     def __init__(self):
         self.page: Page = None
@@ -172,21 +195,27 @@ class YouTubeExporter:
     
     async def unselect_all(self):
         """取消所有勾选"""
-        for _ in range(3):  # 最多尝试3轮
+        for attempt in range(5):  # 最多尝试5轮
             checkboxes = await self.get_video_checkboxes()
             checked = [cb for cb in checkboxes if cb['checked']]
             
             if not checked:
                 break
             
+            print(f"      取消 {len(checked)} 个勾选...")
             for cb in checked:
                 try:
                     await self.page.mouse.click(cb['x'], cb['y'])
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.25)
                 except:
                     pass
             
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
+        
+        # 验证
+        final_count = await self.count_checked()
+        if final_count > 0:
+            print(f"      ⚠️ 仍有 {final_count} 个被勾选")
     
     async def scroll_down_once(self) -> int:
         """向下滚动一次，返回当前视频数量"""
@@ -423,9 +452,10 @@ class YouTubeExporter:
                     if video_id in batch_ids and not cb['checked'] and video_id not in selected_ids:
                         try:
                             await self.page.mouse.click(cb['x'], cb['y'])
-                            await asyncio.sleep(0.25)
+                            await asyncio.sleep(0.3)
                             selected_count += 1
                             selected_ids.append(video_id)
+                            print(f"      ✓ 勾选: {video_id[:30]}...")
                         except Exception as e:
                             print(f"      ⚠️ 勾选失败: {e}")
                 
@@ -433,10 +463,14 @@ class YouTubeExporter:
                 if selected_count >= len(batch):
                     break
                 
-                # 继续滚动
-                await self.scroll_down_once()
+                # 如果当前页面没有更多要勾选的，才滚动
+                if scroll_attempt < 19:
+                    await self.scroll_down_once()
             
-            print(f"   ✅ 已勾选 {selected_count}/{len(batch)} 个视频")
+            # 验证实际勾选数量
+            await asyncio.sleep(0.5)
+            actual_checked = await self.count_checked()
+            print(f"   ✅ 已勾选 {selected_count}/{len(batch)} 个视频 (实际验证: {actual_checked})")
             
             if selected_count == 0:
                 print("   ⚠️ 这批没有勾选到视频，跳过")
@@ -449,6 +483,23 @@ class YouTubeExporter:
             if filepath:
                 downloaded_files.append(filepath)
                 print(f"   ✅ 下载成功: {os.path.basename(filepath)}")
+                
+                # 验证：检查 ZIP 里实际包含哪些视频
+                actual_videos = get_videos_from_zip(filepath)
+                print(f"   📋 ZIP 内实际视频 ({len(actual_videos)} 个):")
+                for v in actual_videos[:5]:  # 只显示前5个
+                    print(f"      - {v[:40]}...")
+                if len(actual_videos) > 5:
+                    print(f"      ... 还有 {len(actual_videos) - 5} 个")
+                
+                # 对比：我们选的 vs 实际导出的
+                selected_set = set(s[:20] for s in selected_ids)
+                actual_set = set(v[:20] for v in actual_videos)
+                if selected_set != actual_set:
+                    print(f"   ⚠️ 警告：选中的视频与导出的不一致！")
+                    print(f"      选中: {len(selected_ids)} 个")
+                    print(f"      实际: {len(actual_videos)} 个")
+                
                 for vid in selected_ids:
                     self.exported_videos.add(vid)
             else:
@@ -496,6 +547,7 @@ def merge_exports(download_dir: str = DOWNLOADS_DIR) -> dict:
     totals_data = None
     chart_data_rows = []
     chart_fieldnames = None
+    all_videos_in_charts = {}  # 记录每个文件包含的视频
     
     zip_files = sorted([f for f in os.listdir(download_dir) if f.endswith('.zip')])
     
@@ -508,6 +560,7 @@ def merge_exports(download_dir: str = DOWNLOADS_DIR) -> dict:
     for i, filename in enumerate(zip_files):
         filepath = os.path.join(download_dir, filename)
         is_first = (i == 0)
+        videos_in_this_file = set()
         
         try:
             with zipfile.ZipFile(filepath, 'r') as zf:
@@ -536,11 +589,34 @@ def merge_exports(download_dir: str = DOWNLOADS_DIR) -> dict:
                             for row in reader:
                                 chart_data_rows.append(dict(row))
                                 row_count += 1
+                                # 记录视频名
+                                for col in ['视频标题', 'Video title', '视频', 'Video', 'Content']:
+                                    if col in row and row[col]:
+                                        videos_in_this_file.add(row[col])
+                                        break
                             
-                            print(f"   📊 Chart data 第{i+1}批: +{row_count} 行")
+                            print(f"\n   📊 ZIP #{i+1}: {filename}")
+                            print(f"      Chart data: {row_count} 行")
+                            print(f"      包含视频 ({len(videos_in_this_file)} 个):")
+                            for v in list(videos_in_this_file)[:8]:
+                                print(f"        - {v[:50]}")
+                            if len(videos_in_this_file) > 8:
+                                print(f"        ... 还有 {len(videos_in_this_file) - 8} 个")
+                            
+                            all_videos_in_charts[filename] = videos_in_this_file
                             
         except Exception as e:
             print(f"   ⚠️ 处理 {filename} 出错: {e}")
+    
+    # 检查重复
+    print(f"\n   📋 重复检查:")
+    all_unique_videos = set()
+    for fname, videos in all_videos_in_charts.items():
+        overlap = all_unique_videos & videos
+        if overlap:
+            print(f"      ⚠️ {fname} 有 {len(overlap)} 个重复视频")
+        all_unique_videos.update(videos)
+    print(f"      总计去重后: {len(all_unique_videos)} 个不同视频")
     
     # 保存结果
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
