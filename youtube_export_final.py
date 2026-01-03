@@ -188,11 +188,8 @@ class YouTubeExporter:
             
             await asyncio.sleep(0.3)
     
-    async def scroll_down(self) -> bool:
-        """向下滚动表格区域，返回是否有新内容"""
-        old_checkboxes = await self.get_video_checkboxes()
-        old_count = len(old_checkboxes)
-        
+    async def scroll_down_once(self) -> int:
+        """向下滚动一次，返回当前视频数量"""
         await self.page.evaluate("""
             () => {
                 // 找表格容器并滚动
@@ -202,18 +199,73 @@ class YouTubeExporter:
                 );
                 for (const el of scrollables) {
                     if (el.scrollHeight > el.clientHeight) {
-                        el.scrollBy(0, 400);
+                        el.scrollBy(0, 500);
                     }
                 }
-                window.scrollBy(0, 400);
+                window.scrollBy(0, 500);
             }
         """)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1)
+        checkboxes = await self.get_video_checkboxes()
+        return len(checkboxes)
+    
+    async def scroll_to_top(self):
+        """滚动回顶部"""
+        await self.page.evaluate("""
+            () => {
+                const scrollables = document.querySelectorAll(
+                    '[class*="table-body"], [class*="scroll"], ' +
+                    '[style*="overflow"], main, [class*="content"]'
+                );
+                for (const el of scrollables) {
+                    if (el.scrollHeight > el.clientHeight) {
+                        el.scrollTop = 0;
+                    }
+                }
+                window.scrollTo(0, 0);
+            }
+        """)
+        await asyncio.sleep(0.5)
+    
+    async def load_all_videos(self) -> list:
+        """
+        持续滚动直到加载所有视频，返回所有视频的信息列表
+        这是更稳健的方法：先加载全部，再处理
+        """
+        print("   📜 加载所有视频（滚动到底）...")
         
-        new_checkboxes = await self.get_video_checkboxes()
-        new_count = len(new_checkboxes)
+        all_videos = {}  # 用 text 作为 key 去重
+        no_new_count = 0
+        max_scrolls = 30  # 最多滚动30次
         
-        return new_count != old_count
+        for scroll_num in range(max_scrolls):
+            checkboxes = await self.get_video_checkboxes()
+            
+            # 统计新发现的视频
+            new_found = 0
+            for cb in checkboxes:
+                video_id = cb['text'].strip()[:50]
+                if video_id and video_id not in all_videos:
+                    all_videos[video_id] = cb
+                    new_found += 1
+            
+            print(f"      滚动 {scroll_num + 1}: 可见 {len(checkboxes)} 个, 累计发现 {len(all_videos)} 个视频", end="\r")
+            
+            if new_found == 0:
+                no_new_count += 1
+                if no_new_count >= 3:  # 连续3次没有新视频，认为到底了
+                    break
+            else:
+                no_new_count = 0
+            
+            await self.scroll_down_once()
+        
+        print(f"\n   ✅ 共发现 {len(all_videos)} 个视频")
+        
+        # 滚动回顶部
+        await self.scroll_to_top()
+        
+        return list(all_videos.values())
     
     async def click_export_button(self) -> bool:
         """点击导出按钮"""
@@ -311,97 +363,112 @@ class YouTubeExporter:
             return None
     
     async def export_all(self) -> list:
-        """批量导出所有视频"""
+        """
+        批量导出所有视频 - 稳健版本
+        
+        策略：
+        1. 先滚动到底，发现所有视频并记录
+        2. 滚回顶部
+        3. 分批处理：每批最多12个视频
+           - 对于每批：滚动找到这些视频，勾选，导出
+        """
         print("\n" + "=" * 55)
-        print("   📊 开始批量导出")
+        print("   📊 开始批量导出（稳健版）")
         print("=" * 55)
         
-        downloaded_files = []
-        round_num = 0
-        no_progress_count = 0
+        # 第1步：先加载并发现所有视频
+        all_videos = await self.load_all_videos()
+        total_videos = len(all_videos)
         
-        while round_num < MAX_EXPORT_ROUNDS:
-            round_num += 1
+        if total_videos == 0:
+            print("   ❌ 没有找到视频")
+            return []
+        
+        # 分批：每批最多12个
+        batches = []
+        for i in range(0, total_videos, MAX_VIDEOS_PER_EXPORT):
+            batch = all_videos[i:i + MAX_VIDEOS_PER_EXPORT]
+            batches.append(batch)
+        
+        print(f"\n   📊 共 {total_videos} 个视频，分 {len(batches)} 批导出")
+        
+        downloaded_files = []
+        
+        # 第2步：逐批处理
+        for batch_num, batch in enumerate(batches, 1):
             print(f"\n{'─' * 55}")
-            print(f"📥 第 {round_num} 轮")
+            print(f"📥 第 {batch_num}/{len(batches)} 批 ({len(batch)} 个视频)")
             print(f"{'─' * 55}")
             
-            # 1. 先取消所有勾选
+            # 2.1 取消所有勾选
             print("   🔄 取消已有勾选...")
             await self.unselect_all()
             await asyncio.sleep(0.5)
             
-            # 2. 获取当前可见的视频复选框
-            checkboxes = await self.get_video_checkboxes()
-            print(f"   📋 当前可见 {len(checkboxes)} 个视频")
+            # 2.2 收集这批视频的标识
+            batch_ids = set(cb['text'].strip()[:50] for cb in batch)
             
-            # 3. 筛选出未导出过的视频（用文本标识判断）
-            not_exported = []
-            for cb in checkboxes:
-                video_id = cb['text'].strip()[:30]  # 用前30字符作为标识
-                if video_id and video_id not in self.exported_videos:
-                    not_exported.append(cb)
-            
-            print(f"   📋 其中 {len(not_exported)} 个未导出")
-            
-            if not not_exported:
-                # 尝试滚动加载更多
-                print("   📜 滚动查找更多视频...")
-                await self.scroll_down()
-                await asyncio.sleep(1)
-                
-                checkboxes = await self.get_video_checkboxes()
-                not_exported = []
-                for cb in checkboxes:
-                    video_id = cb['text'].strip()[:30]
-                    if video_id and video_id not in self.exported_videos:
-                        not_exported.append(cb)
-                
-            if not not_exported:
-                # 滚动后还是没有新视频，直接结束
-                print("\n   ✅ 所有视频都已导出完成！")
-                break
-            
-            no_progress_count = 0
-            
-            # 4. 勾选这批视频（最多12个）
-            to_select = not_exported[:MAX_VIDEOS_PER_EXPORT]
+            # 2.3 滚动并勾选这批视频
+            print(f"   ☑️ 勾选本批 {len(batch)} 个视频...")
             selected_count = 0
             selected_ids = []
             
-            print(f"   ☑️ 勾选 {len(to_select)} 个视频...")
-            for cb in to_select:
-                try:
-                    await self.page.mouse.click(cb['x'], cb['y'])
-                    await asyncio.sleep(0.3)
-                    selected_count += 1
-                    selected_ids.append(cb['text'].strip()[:30])
-                except Exception as e:
-                    print(f"   ⚠️ 勾选失败: {e}")
+            # 滚动遍历，找到并勾选属于这批的视频
+            for scroll_attempt in range(20):  # 最多滚动20次
+                current_checkboxes = await self.get_video_checkboxes()
+                
+                for cb in current_checkboxes:
+                    video_id = cb['text'].strip()[:50]
+                    # 属于这批 且 未勾选 且 还没选过
+                    if video_id in batch_ids and not cb['checked'] and video_id not in selected_ids:
+                        try:
+                            await self.page.mouse.click(cb['x'], cb['y'])
+                            await asyncio.sleep(0.25)
+                            selected_count += 1
+                            selected_ids.append(video_id)
+                        except Exception as e:
+                            print(f"      ⚠️ 勾选失败: {e}")
+                
+                # 检查是否已经勾选完这批所有视频
+                if selected_count >= len(batch):
+                    break
+                
+                # 继续滚动
+                await self.scroll_down_once()
             
-            print(f"   ✅ 已勾选 {selected_count} 个视频")
+            print(f"   ✅ 已勾选 {selected_count}/{len(batch)} 个视频")
             
             if selected_count == 0:
+                print("   ⚠️ 这批没有勾选到视频，跳过")
                 continue
             
-            # 5. 导出
+            # 2.4 导出
             print("   📤 导出中...")
             filepath = await self.export_once()
             
             if filepath:
                 downloaded_files.append(filepath)
                 print(f"   ✅ 下载成功: {os.path.basename(filepath)}")
-                # 记录这批已导出的视频
                 for vid in selected_ids:
                     self.exported_videos.add(vid)
-                print(f"   📊 累计已导出 {len(self.exported_videos)} 个视频")
             else:
-                print(f"   ❌ 导出失败")
+                print(f"   ❌ 导出失败，重试...")
+                # 简单重试一次
+                await asyncio.sleep(2)
+                filepath = await self.export_once()
+                if filepath:
+                    downloaded_files.append(filepath)
+                    print(f"   ✅ 重试成功")
+                    for vid in selected_ids:
+                        self.exported_videos.add(vid)
             
+            # 滚回顶部，准备下一批
+            await self.scroll_to_top()
             await asyncio.sleep(1)
         
         print(f"\n{'=' * 55}")
-        print(f"   📊 完成！共导出 {len(downloaded_files)} 个文件")
+        print(f"   📊 完成！")
+        print(f"   📊 共导出 {len(downloaded_files)} 个文件")
         print(f"   📊 覆盖 {len(self.exported_videos)} 个视频")
         print(f"{'=' * 55}")
         
