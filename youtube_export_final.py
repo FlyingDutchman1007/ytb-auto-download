@@ -103,13 +103,14 @@ class YouTubeExporter:
             return False
     
     async def get_video_checkboxes(self) -> list:
-        """获取所有视频的复选框"""
+        """获取所有视频的复选框，返回包含索引的信息"""
         checkboxes = await self.page.evaluate(r'''() => {
             const results = [];
             
             // 找 role=checkbox 的元素
             const allCheckboxes = document.querySelectorAll("[role='checkbox']");
             
+            let index = 0;
             for (const cb of allCheckboxes) {
                 const rect = cb.getBoundingClientRect();
                 
@@ -129,11 +130,13 @@ class YouTubeExporter:
                 
                 // 跳过"合计"行
                 if (text.includes("合计") || text.includes("Total") || text.includes("总计")) {
+                    index++;
                     continue;
                 }
                 
                 // 跳过没有视频信息的行（视频行会有时长如 2:31）
                 if (!text.match(/\d:\d\d/)) {
+                    index++;
                     continue;
                 }
                 
@@ -141,16 +144,50 @@ class YouTubeExporter:
                 const isChecked = cb.getAttribute("aria-checked") === "true";
                 
                 results.push({
+                    index: index,
                     x: rect.x + rect.width / 2,
                     y: rect.y + rect.height / 2,
                     checked: isChecked,
                     text: text.substring(0, 50).replace(/\n/g, " ")
                 });
+                index++;
             }
             
             return results;
         }''')
         return checkboxes or []
+    
+    async def click_checkbox_by_text(self, target_text: str) -> bool:
+        """用 JavaScript 直接点击包含指定文本的 checkbox"""
+        result = await self.page.evaluate(r'''(targetText) => {
+            const allCheckboxes = document.querySelectorAll("[role='checkbox']");
+            
+            for (const cb of allCheckboxes) {
+                // 找父行
+                let row = cb;
+                let text = "";
+                for (let i = 0; i < 10 && row; i++) {
+                    row = row.parentElement;
+                    if (row && row.innerText && row.innerText.length > 10) {
+                        text = row.innerText;
+                        break;
+                    }
+                }
+                
+                // 匹配文本（前30字符）
+                if (text.substring(0, 30) === targetText.substring(0, 30)) {
+                    // 直接点击 checkbox
+                    cb.click();
+                    // 返回点击后的状态
+                    return {
+                        success: true,
+                        newState: cb.getAttribute("aria-checked") === "true"
+                    };
+                }
+            }
+            return { success: false };
+        }''', target_text)
+        return result.get('success', False), result.get('newState', False)
     
     async def count_checked(self) -> int:
         """计算当前勾选的视频数量"""
@@ -194,22 +231,27 @@ class YouTubeExporter:
         return selected_count
     
     async def unselect_all(self):
-        """取消所有勾选"""
+        """取消所有勾选 - 使用 JavaScript 直接操作"""
         for attempt in range(5):  # 最多尝试5轮
-            checkboxes = await self.get_video_checkboxes()
-            checked = [cb for cb in checkboxes if cb['checked']]
+            # 用 JS 找出所有已勾选的并取消
+            result = await self.page.evaluate(r'''() => {
+                const allCheckboxes = document.querySelectorAll("[role='checkbox']");
+                let uncheckedCount = 0;
+                
+                for (const cb of allCheckboxes) {
+                    if (cb.getAttribute("aria-checked") === "true") {
+                        cb.click();
+                        uncheckedCount++;
+                    }
+                }
+                
+                return uncheckedCount;
+            }''')
             
-            if not checked:
+            if result == 0:
                 break
             
-            print(f"      取消 {len(checked)} 个勾选...")
-            for cb in checked:
-                try:
-                    await self.page.mouse.click(cb['x'], cb['y'])
-                    await asyncio.sleep(0.25)
-                except:
-                    pass
-            
+            print(f"      取消了 {result} 个勾选...")
             await asyncio.sleep(0.5)
         
         # 验证
@@ -434,43 +476,46 @@ class YouTubeExporter:
             await self.unselect_all()
             await asyncio.sleep(0.5)
             
-            # 2.2 收集这批视频的标识
-            batch_ids = set(cb['text'].strip()[:50] for cb in batch)
+            # 验证取消结果
+            pre_check = await self.count_checked()
+            print(f"   📋 取消后当前勾选数: {pre_check}")
             
-            # 2.3 滚动并勾选这批视频
+            # 2.2 收集这批视频的文本标识
+            batch_texts = [cb['text'].strip() for cb in batch]
+            
+            # 2.3 用 JavaScript 直接勾选
             print(f"   ☑️ 勾选本批 {len(batch)} 个视频...")
             selected_count = 0
             selected_ids = []
             
-            # 滚动遍历，找到并勾选属于这批的视频
-            for scroll_attempt in range(20):  # 最多滚动20次
-                current_checkboxes = await self.get_video_checkboxes()
-                
-                for cb in current_checkboxes:
-                    video_id = cb['text'].strip()[:50]
-                    # 属于这批 且 未勾选 且 还没选过
-                    if video_id in batch_ids and not cb['checked'] and video_id not in selected_ids:
-                        try:
-                            await self.page.mouse.click(cb['x'], cb['y'])
-                            await asyncio.sleep(0.3)
+            for video_text in batch_texts:
+                success, new_state = await self.click_checkbox_by_text(video_text)
+                if success:
+                    if new_state:  # 确认变成了选中状态
+                        selected_count += 1
+                        selected_ids.append(video_text[:30])
+                        print(f"      ✓ {video_text[:35]}...")
+                    else:
+                        print(f"      ⚠️ 点击了但未选中: {video_text[:30]}...")
+                else:
+                    # 可能需要滚动才能找到
+                    found = False
+                    for _ in range(5):
+                        await self.scroll_down_once()
+                        success, new_state = await self.click_checkbox_by_text(video_text)
+                        if success and new_state:
                             selected_count += 1
-                            selected_ids.append(video_id)
-                            print(f"      ✓ 勾选: {video_id[:30]}...")
-                        except Exception as e:
-                            print(f"      ⚠️ 勾选失败: {e}")
-                
-                # 检查是否已经勾选完这批所有视频
-                if selected_count >= len(batch):
-                    break
-                
-                # 如果当前页面没有更多要勾选的，才滚动
-                if scroll_attempt < 19:
-                    await self.scroll_down_once()
+                            selected_ids.append(video_text[:30])
+                            print(f"      ✓ (滚动后) {video_text[:35]}...")
+                            found = True
+                            break
+                    if not found:
+                        print(f"      ✗ 未找到: {video_text[:30]}...")
             
             # 验证实际勾选数量
             await asyncio.sleep(0.5)
             actual_checked = await self.count_checked()
-            print(f"   ✅ 已勾选 {selected_count}/{len(batch)} 个视频 (实际验证: {actual_checked})")
+            print(f"   ✅ 勾选完成: 目标 {len(batch)}, 成功 {selected_count}, 实际验证 {actual_checked}")
             
             if selected_count == 0:
                 print("   ⚠️ 这批没有勾选到视频，跳过")
