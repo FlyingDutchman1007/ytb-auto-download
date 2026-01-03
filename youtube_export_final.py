@@ -425,67 +425,118 @@ class YouTubeExporter:
             await self.page.keyboard.press("Escape")
             return None
     
-    async def select_first_n_unchecked(self, n: int = 6) -> tuple:
+    async def select_first_n_unchecked(self, n: int = 6, exclude_titles: set = None) -> tuple:
         """
-        用 Playwright locator 点击前 N 个未勾选的视频 checkbox
-        返回 (成功数量, 视频标题列表)
+        改进版：使用 JS 预筛选，提高稳定性和速度
         """
-        # 找所有 checkbox
-        checkboxes = self.page.locator("[role='checkbox']")
-        count = await checkboxes.count()
-        
+        if exclude_titles is None:
+            exclude_titles = set()
+
+        # 使用 JS 获取所有符合条件的 checkbox 索引和标题
+        # 这样比在 Python 里一个个查询 DOM 要快得多且稳定
+        candidates = await self.page.evaluate(r'''() => {
+            const items = [];
+            const checkboxes = document.querySelectorAll("[role='checkbox']");
+            
+            for (let i = 0; i < checkboxes.length; i++) {
+                const cb = checkboxes[i];
+                const rect = cb.getBoundingClientRect();
+                
+                // 1. 检查可见性 (宽/高必须大于0)
+                if (rect.width === 0 || rect.height === 0) {
+                    continue;
+                }
+
+                // 2. 获取行文本 (向上查找几层)
+                let row = cb;
+                let text = "";
+                // 尝试找 row 容器
+                for (let k = 0; k < 8; k++) {
+                    if (!row.parentElement) break;
+                    row = row.parentElement;
+                    // 简单的启发式：如果 innerText 够长，可能是行
+                    if (row.innerText && row.innerText.length > 15) {
+                        text = row.innerText;
+                        // 找到了就停止，避免找到整个 body
+                        break;
+                    }
+                }
+                
+                // 3. 过滤逻辑
+                if (!text) continue;
+                
+                // 跳过表头 (表头通常包含特定的列名组合)
+                if ((text.includes("视频") || text.includes("Video")) && 
+                    (text.includes("日期") || text.includes("Date")) && 
+                    (text.includes("观看次数") || text.includes("Views"))) {
+                    continue;
+                }
+                
+                // 跳过合计行
+                if (text.includes("合计") || text.includes("Total") || text.includes("总计")) continue;
+                
+                // 提取标题 (第一行通常是标题)
+                const lines = text.split('\n');
+                let title = "";
+                // 尝试找到第一段非空的文本作为标题
+                for (const line of lines) {
+                    const t = line.trim();
+                    if (t.length > 1 && !t.match(/^\d+:\d+$/)) { // 跳过纯时间字符串
+                        title = t;
+                        break;
+                    }
+                }
+                if (!title) title = "Unknown Video " + i;
+                if (title.length > 50) title = title.substring(0, 50);
+
+                // 检查是否已勾选
+                const isChecked = cb.getAttribute("aria-checked") === "true";
+                if (isChecked) continue;
+
+                items.push({
+                    index: i,
+                    title: title
+                });
+            }
+            return items;
+        }''')
+
         selected = []
         selected_count = 0
         
-        for i in range(count):
+        # Playwright locator 指向所有 checkbox
+        all_checkboxes = self.page.locator("[role='checkbox']")
+        
+        for item in candidates:
             if selected_count >= n:
                 break
+                
+            title = item['title']
             
-            cb = checkboxes.nth(i)
-            
-            try:
-                # 检查是否可见
-                if not await cb.is_visible():
-                    continue
-                
-                # 获取父行文本
-                parent = cb.locator("xpath=ancestor::*[string-length(normalize-space()) > 20][1]")
-                text = ""
-                try:
-                    text = await parent.inner_text(timeout=500)
-                except:
-                    pass
-                
-                # 跳过合计行
-                if "合计" in text or "Total" in text:
-                    continue
-                
-                # 必须是视频行（有时长）
-                import re
-                if not re.search(r'\d:\d\d', text):
-                    continue
-                
-                # 检查是否已勾选
-                checked = await cb.get_attribute("aria-checked")
-                if checked == "true":
-                    continue
-                
-                # 用 Playwright 点击（最可靠的方式）
-                await cb.click()
-                await asyncio.sleep(0.3)
-                
-                # 验证点击后状态
-                new_checked = await cb.get_attribute("aria-checked")
-                if new_checked == "true":
-                    selected_count += 1
-                    title = text.split('\n')[0][:40] if text else f"视频{i}"
-                    selected.append(title)
-                    print(f"      ✓ [{selected_count}] {title}")
-                else:
-                    print(f"      ✗ 点击无效: {text[:30]}")
-                    
-            except Exception as e:
+            # 黑名单过滤
+            if title in exclude_titles:
                 continue
+                
+            try:
+                # 使用 nth(index) 定位
+                cb = all_checkboxes.nth(item['index'])
+                
+                # 确保元素在视口内 (Playwright click 会自动滚动，但有时候需要强制)
+                # await cb.scroll_into_view_if_needed()
+                
+                # 点击
+                await cb.click(timeout=2000)
+                
+                # 简单的验证：虽然我们不能立即确认 aria-checked 变了（有动画延迟），
+                # 但只要不报错，我们就假设点击成功了。
+                # 下一轮循环或者导出前的检查会处理异常情况。
+                
+                selected.append(title)
+                selected_count += 1
+                print(f"      ✓ [{selected_count}] {title}")
+                
+            except Exception as e:
+                print(f"      ⚠️ 点击失败 [{title}]: {e}")
         
         return selected_count, selected
 
@@ -501,6 +552,7 @@ class YouTubeExporter:
         
         downloaded_files = []
         exported_video_titles = set()  # 用标题判重
+        processed_titles = set()       # 记录已处理（勾选过）的视频，防止重复勾选
         round_num = 0
         
         while round_num < MAX_EXPORT_ROUNDS:
@@ -516,19 +568,23 @@ class YouTubeExporter:
             
             # 2. 直接用 JS 勾选前12个未勾选视频
             print("   ☑️ 勾选视频...")
-            count, videos = await self.select_first_n_unchecked(MAX_VIDEOS_PER_EXPORT)
+            # 传入 processed_titles 以跳过已处理的视频
+            count, videos = await self.select_first_n_unchecked(MAX_VIDEOS_PER_EXPORT, exclude_titles=processed_titles)
             
             print(f"   ✅ 成功勾选 {count} 个视频:")
             for v in videos:
                 print(f"      - {v[:45]}")
+                processed_titles.add(v)  # 标记为已处理
             
             if count == 0:
                 # 尝试滚动找更多
                 print("   📜 滚动查找更多...")
                 for _ in range(3):
                     await self.scroll_down_once()
-                    count, videos = await self.select_first_n_unchecked(MAX_VIDEOS_PER_EXPORT)
+                    count, videos = await self.select_first_n_unchecked(MAX_VIDEOS_PER_EXPORT, exclude_titles=processed_titles)
                     if count > 0:
+                        for v in videos:
+                            processed_titles.add(v)
                         break
                 
                 if count == 0:
@@ -562,8 +618,6 @@ class YouTubeExporter:
         print(f"   📊 完成！共 {len(downloaded_files)} 个文件")
         print(f"   📊 累计 {len(exported_video_titles)} 个不同视频")
         print(f"{'=' * 55}")
-        
-        return downloaded_files
         
         return downloaded_files
     
