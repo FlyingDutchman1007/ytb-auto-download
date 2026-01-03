@@ -433,140 +433,132 @@ class YouTubeExporter:
             await self.page.keyboard.press("Escape")
             return None
     
+    async def select_first_n_unchecked(self, n: int = 12) -> tuple:
+        """
+        直接用 JavaScript 勾选当前页面前 N 个未勾选的视频
+        返回 (成功数量, 视频标题列表)
+        """
+        result = await self.page.evaluate(r'''(maxCount) => {
+            const allCheckboxes = document.querySelectorAll("[role='checkbox']");
+            const selected = [];
+            let count = 0;
+            
+            for (const cb of allCheckboxes) {
+                if (count >= maxCount) break;
+                
+                const rect = cb.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                
+                // 跳过已勾选的
+                if (cb.getAttribute("aria-checked") === "true") continue;
+                
+                // 找父行获取文本
+                let row = cb;
+                let text = "";
+                for (let i = 0; i < 10 && row; i++) {
+                    row = row.parentElement;
+                    if (row && row.innerText && row.innerText.length > 10) {
+                        text = row.innerText;
+                        break;
+                    }
+                }
+                
+                // 跳过"合计"行
+                if (text.includes("合计") || text.includes("Total")) continue;
+                
+                // 必须有时长（视频行特征）
+                if (!text.match(/\d:\d\d/)) continue;
+                
+                // 点击勾选
+                cb.click();
+                
+                // 验证是否勾选成功
+                if (cb.getAttribute("aria-checked") === "true") {
+                    count++;
+                    selected.push(text.substring(0, 40).replace(/\n/g, " "));
+                }
+            }
+            
+            return { count: count, videos: selected };
+        }''', n)
+        
+        return result.get('count', 0), result.get('videos', [])
+
     async def export_all(self) -> list:
         """
-        批量导出所有视频 - 稳健版本
+        批量导出所有视频 - 简单直接版
         
-        策略：
-        1. 先滚动到底，发现所有视频并记录
-        2. 滚回顶部
-        3. 分批处理：每批最多12个视频
-           - 对于每批：滚动找到这些视频，勾选，导出
+        策略：每轮直接在当前页面勾选12个，导出，滚动，重复
         """
         print("\n" + "=" * 55)
-        print("   📊 开始批量导出（稳健版）")
+        print("   📊 开始批量导出")
         print("=" * 55)
         
-        # 第1步：先加载并发现所有视频
-        all_videos = await self.load_all_videos()
-        total_videos = len(all_videos)
-        
-        if total_videos == 0:
-            print("   ❌ 没有找到视频")
-            return []
-        
-        # 分批：每批最多12个
-        batches = []
-        for i in range(0, total_videos, MAX_VIDEOS_PER_EXPORT):
-            batch = all_videos[i:i + MAX_VIDEOS_PER_EXPORT]
-            batches.append(batch)
-        
-        print(f"\n   📊 共 {total_videos} 个视频，分 {len(batches)} 批导出")
-        
         downloaded_files = []
+        exported_video_titles = set()  # 用标题判重
+        round_num = 0
         
-        # 第2步：逐批处理
-        for batch_num, batch in enumerate(batches, 1):
+        while round_num < MAX_EXPORT_ROUNDS:
+            round_num += 1
             print(f"\n{'─' * 55}")
-            print(f"📥 第 {batch_num}/{len(batches)} 批 ({len(batch)} 个视频)")
+            print(f"📥 第 {round_num} 轮")
             print(f"{'─' * 55}")
             
-            # 2.1 取消所有勾选
-            print("   🔄 取消已有勾选...")
+            # 1. 取消所有勾选
+            print("   🔄 取消所有勾选...")
             await self.unselect_all()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
             
-            # 验证取消结果
-            pre_check = await self.count_checked()
-            print(f"   📋 取消后当前勾选数: {pre_check}")
+            # 2. 直接用 JS 勾选前12个未勾选视频
+            print("   ☑️ 勾选视频...")
+            count, videos = await self.select_first_n_unchecked(MAX_VIDEOS_PER_EXPORT)
             
-            # 2.2 收集这批视频的文本标识
-            batch_texts = [cb['text'].strip() for cb in batch]
+            print(f"   ✅ 成功勾选 {count} 个视频:")
+            for v in videos:
+                print(f"      - {v[:45]}")
             
-            # 2.3 用 JavaScript 直接勾选
-            print(f"   ☑️ 勾选本批 {len(batch)} 个视频...")
-            selected_count = 0
-            selected_ids = []
+            if count == 0:
+                # 尝试滚动找更多
+                print("   📜 滚动查找更多...")
+                for _ in range(3):
+                    await self.scroll_down_once()
+                    count, videos = await self.select_first_n_unchecked(MAX_VIDEOS_PER_EXPORT)
+                    if count > 0:
+                        break
+                
+                if count == 0:
+                    print("   ✅ 所有视频都已导出完成！")
+                    break
             
-            for video_text in batch_texts:
-                success, new_state = await self.click_checkbox_by_text(video_text)
-                if success:
-                    if new_state:  # 确认变成了选中状态
-                        selected_count += 1
-                        selected_ids.append(video_text[:30])
-                        print(f"      ✓ {video_text[:35]}...")
-                    else:
-                        print(f"      ⚠️ 点击了但未选中: {video_text[:30]}...")
-                else:
-                    # 可能需要滚动才能找到
-                    found = False
-                    for _ in range(5):
-                        await self.scroll_down_once()
-                        success, new_state = await self.click_checkbox_by_text(video_text)
-                        if success and new_state:
-                            selected_count += 1
-                            selected_ids.append(video_text[:30])
-                            print(f"      ✓ (滚动后) {video_text[:35]}...")
-                            found = True
-                            break
-                    if not found:
-                        print(f"      ✗ 未找到: {video_text[:30]}...")
-            
-            # 验证实际勾选数量
-            await asyncio.sleep(0.5)
-            actual_checked = await self.count_checked()
-            print(f"   ✅ 勾选完成: 目标 {len(batch)}, 成功 {selected_count}, 实际验证 {actual_checked}")
-            
-            if selected_count == 0:
-                print("   ⚠️ 这批没有勾选到视频，跳过")
-                continue
-            
-            # 2.4 导出
-            print("   📤 导出中...")
+            # 3. 导出
+            print("   📤 导出...")
             filepath = await self.export_once()
             
             if filepath:
                 downloaded_files.append(filepath)
-                print(f"   ✅ 下载成功: {os.path.basename(filepath)}")
+                print(f"   ✅ 下载: {os.path.basename(filepath)}")
                 
-                # 验证：检查 ZIP 里实际包含哪些视频
+                # 检查 ZIP 里的视频
                 actual_videos = get_videos_from_zip(filepath)
-                print(f"   📋 ZIP 内实际视频 ({len(actual_videos)} 个):")
-                for v in actual_videos[:5]:  # 只显示前5个
-                    print(f"      - {v[:40]}...")
-                if len(actual_videos) > 5:
-                    print(f"      ... 还有 {len(actual_videos) - 5} 个")
+                print(f"   📋 ZIP 包含 {len(actual_videos)} 个视频:")
+                for v in actual_videos:
+                    print(f"      - {v[:45]}")
+                    exported_video_titles.add(v)
                 
-                # 对比：我们选的 vs 实际导出的
-                selected_set = set(s[:20] for s in selected_ids)
-                actual_set = set(v[:20] for v in actual_videos)
-                if selected_set != actual_set:
-                    print(f"   ⚠️ 警告：选中的视频与导出的不一致！")
-                    print(f"      选中: {len(selected_ids)} 个")
-                    print(f"      实际: {len(actual_videos)} 个")
-                
-                for vid in selected_ids:
-                    self.exported_videos.add(vid)
+                print(f"   📊 累计导出 {len(exported_video_titles)} 个不同视频")
             else:
-                print(f"   ❌ 导出失败，重试...")
-                # 简单重试一次
-                await asyncio.sleep(2)
-                filepath = await self.export_once()
-                if filepath:
-                    downloaded_files.append(filepath)
-                    print(f"   ✅ 重试成功")
-                    for vid in selected_ids:
-                        self.exported_videos.add(vid)
+                print("   ❌ 导出失败")
             
-            # 滚回顶部，准备下一批
-            await self.scroll_to_top()
-            await asyncio.sleep(1)
+            # 4. 滚动，准备下一轮
+            await self.scroll_down_once()
+            await asyncio.sleep(0.5)
         
         print(f"\n{'=' * 55}")
-        print(f"   📊 完成！")
-        print(f"   📊 共导出 {len(downloaded_files)} 个文件")
-        print(f"   📊 覆盖 {len(self.exported_videos)} 个视频")
+        print(f"   📊 完成！共 {len(downloaded_files)} 个文件")
+        print(f"   📊 累计 {len(exported_video_titles)} 个不同视频")
         print(f"{'=' * 55}")
+        
+        return downloaded_files
         
         return downloaded_files
     
