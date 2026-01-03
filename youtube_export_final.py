@@ -34,7 +34,7 @@ except ImportError:
 CHROME_DEBUG_PORT = 9222
 OUTPUT_DIR = "youtube_exports"
 DOWNLOADS_DIR = os.path.join(OUTPUT_DIR, "downloads")
-MAX_VIDEOS_PER_EXPORT = 6  # 每次6个，更好监控
+MAX_VIDEOS_PER_EXPORT = 5  # 每次5个，更加稳健
 MAX_EXPORT_ROUNDS = 100
 # ==============================================
 
@@ -231,46 +231,46 @@ class YouTubeExporter:
         return selected_count
     
     async def unselect_all(self):
-        """取消所有勾选 - 使用 Playwright locator"""
-        for attempt in range(3):
-            checkboxes = self.page.locator("[role='checkbox'][aria-checked='true']")
-            count = await checkboxes.count()
-            
-            if count == 0:
-                break
-            
-            print(f"      取消 {count} 个勾选...")
-            for i in range(count):
-                try:
-                    cb = checkboxes.nth(i)
-                    if await cb.is_visible():
-                        await cb.click()
-                        await asyncio.sleep(0.2)
-                except:
-                    pass
-            
-            await asyncio.sleep(0.3)
+        """取消所有勾选 - 使用 JS 暴力点击"""
+        await self.page.evaluate(r'''() => {
+            const checkboxes = document.querySelectorAll("[role='checkbox'][aria-checked='true']");
+            for (const cb of checkboxes) {
+                // 暴力点击
+                cb.click();
+            }
+        }''')
+        await asyncio.sleep(0.5)
     
     async def scroll_down_once(self) -> int:
         """向下滚动一次，返回当前视频数量"""
         await self.page.evaluate("""
             () => {
-                // 找表格容器并滚动
+                // 1. 优先尝试滚动 YouTube Studio 专用的表格容器
+                // ytcp-table-body 是包含视频列表的主要容器
+                const tableBody = document.querySelector('ytcp-table-body');
+                if (tableBody && tableBody.scrollHeight > tableBody.clientHeight) {
+                    tableBody.scrollBy(0, 400); // 适配 5 个视频的高度
+                    return;
+                }
+
+                // 2. 备用方案：查找其他可滚动元素
                 const scrollables = document.querySelectorAll(
                     '[class*="table-body"], [class*="scroll"], ' +
                     '[style*="overflow"], main, [class*="content"]'
                 );
                 for (const el of scrollables) {
                     if (el.scrollHeight > el.clientHeight) {
-                        el.scrollBy(0, 500);
+                        el.scrollBy(0, 400);
                     }
                 }
-                window.scrollBy(0, 500);
+                
+                // 3. 最后尝试滚动整个窗口
+                window.scrollBy(0, 400);
             }
         """)
-        await asyncio.sleep(1)
-        checkboxes = await self.get_video_checkboxes()
-        return len(checkboxes)
+        # 给页面一点时间加载新内容
+        await asyncio.sleep(1.5)
+        return 0
     
     async def scroll_to_top(self):
         """滚动回顶部"""
@@ -331,8 +331,8 @@ class YouTubeExporter:
         return list(all_videos.values())
     
     async def click_export_button(self) -> bool:
-        """点击导出按钮"""
-        export_btn = await self.page.evaluate_handle("""
+        """点击导出按钮 - 使用 JS 暴力点击"""
+        result = await self.page.evaluate("""
             () => {
                 // 方法1: aria-label 包含导出
                 const labels = ['导出当前视图', 'Export current view', '导出', 'Export'];
@@ -341,7 +341,8 @@ class YouTubeExporter:
                     for (const btn of btns) {
                         const rect = btn.getBoundingClientRect();
                         if (rect.width > 0 && rect.height > 0) {
-                            return btn;
+                            btn.click();
+                            return true;
                         }
                     }
                 }
@@ -351,27 +352,27 @@ class YouTubeExporter:
                 for (const btn of downloadBtns) {
                     const rect = btn.getBoundingClientRect();
                     if (rect.width > 0 && rect.height > 0) {
-                        return btn;
+                        btn.click();
+                        return true;
                     }
                 }
                 
-                return null;
+                return false;
             }
         """)
         
-        if not export_btn:
+        if not result:
             print("   ❌ 未找到导出按钮")
             return False
         
-        await export_btn.click()
         await asyncio.sleep(1)
         return True
     
     async def click_csv_option(self) -> bool:
-        """点击 CSV 下载选项"""
+        """点击 CSV 下载选项 - 使用 JS 暴力点击"""
         await asyncio.sleep(0.5)
         
-        csv_option = await self.page.evaluate_handle("""
+        result = await self.page.evaluate("""
             () => {
                 // 查找菜单项
                 const items = document.querySelectorAll(
@@ -385,20 +386,20 @@ class YouTubeExporter:
                         if (text.includes('csv') || 
                             text.includes('导出当前视图') || 
                             text.includes('export current view')) {
-                            return item;
+                            item.click();
+                            return true;
                         }
                     }
                 }
-                return null;
+                return false;
             }
         """)
         
-        if not csv_option:
+        if not result:
             await self.page.keyboard.press("Escape")
             print("   ❌ 未找到 CSV 选项")
             return False
         
-        await csv_option.click()
         return True
     
     async def export_once(self) -> str:
@@ -425,120 +426,91 @@ class YouTubeExporter:
             await self.page.keyboard.press("Escape")
             return None
     
-    async def select_first_n_unchecked(self, n: int = 6, exclude_titles: set = None) -> tuple:
+    async def select_first_n_unchecked(self, n: int = 10, exclude_titles: set = None) -> tuple:
         """
-        改进版：使用 JS 预筛选，提高稳定性和速度
+        终极稳定版：纯 JavaScript 勾选
+        直接在浏览器内部执行点击，无视遮挡 (intercepts pointer events) 和动画延迟。
         """
         if exclude_titles is None:
             exclude_titles = set()
 
-        # 使用 JS 获取所有符合条件的 checkbox 索引和标题
-        # 这样比在 Python 里一个个查询 DOM 要快得多且稳定
-        candidates = await self.page.evaluate(r'''() => {
-            const items = [];
+        # 将 exclude_titles 转换为列表传给 JS
+        exclude_list = list(exclude_titles)
+
+        # 执行 JS：查找并直接点击
+        selected_titles = await self.page.evaluate(r'''(args) => {
+            const maxCount = args.n;
+            const excludeSet = new Set(args.excludeList);
+            const results = [];
+            
             const checkboxes = document.querySelectorAll("[role='checkbox']");
             
             for (let i = 0; i < checkboxes.length; i++) {
+                if (results.length >= maxCount) break;
+                
                 const cb = checkboxes[i];
                 const rect = cb.getBoundingClientRect();
                 
-                // 1. 检查可见性 (宽/高必须大于0)
-                if (rect.width === 0 || rect.height === 0) {
-                    continue;
-                }
+                // 1. 基础可见性检查
+                if (rect.width === 0 || rect.height === 0) continue;
 
-                // 2. 获取行文本 (向上查找几层)
+                // 2. 获取标题逻辑
                 let row = cb;
                 let text = "";
-                // 尝试找 row 容器
                 for (let k = 0; k < 8; k++) {
                     if (!row.parentElement) break;
                     row = row.parentElement;
-                    // 简单的启发式：如果 innerText 够长，可能是行
                     if (row.innerText && row.innerText.length > 15) {
                         text = row.innerText;
-                        // 找到了就停止，避免找到整个 body
                         break;
                     }
                 }
                 
-                // 3. 过滤逻辑
                 if (!text) continue;
                 
-                // 跳过表头 (表头通常包含特定的列名组合)
+                // 过滤表头与合计
                 if ((text.includes("视频") || text.includes("Video")) && 
-                    (text.includes("日期") || text.includes("Date")) && 
-                    (text.includes("观看次数") || text.includes("Views"))) {
-                    continue;
-                }
+                    (text.includes("日期") || text.includes("Date"))) continue;
+                if (text.includes("合计") || text.includes("Total")) continue;
                 
-                // 跳过合计行
-                if (text.includes("合计") || text.includes("Total") || text.includes("总计")) continue;
-                
-                // 提取标题 (第一行通常是标题)
+                // 提取标题
                 const lines = text.split('\n');
                 let title = "";
-                // 尝试找到第一段非空的文本作为标题
                 for (const line of lines) {
                     const t = line.trim();
-                    if (t.length > 1 && !t.match(/^\d+:\d+$/)) { // 跳过纯时间字符串
+                    if (t.length > 1 && !t.match(/^\d+:\d+$/)) {
                         title = t;
                         break;
                     }
                 }
-                if (!title) title = "Unknown Video " + i;
+                if (!title) title = "Unknown_" + i;
                 if (title.length > 50) title = title.substring(0, 50);
 
-                // 检查是否已勾选
-                const isChecked = cb.getAttribute("aria-checked") === "true";
-                if (isChecked) continue;
+                // 3. 核心判断
+                // 如果在黑名单里，跳过
+                if (excludeSet.has(title)) continue;
+                
+                // 如果已经勾选，跳过
+                if (cb.getAttribute("aria-checked") === "true") continue;
 
-                items.push({
-                    index: i,
-                    title: title
-                });
+                // 4. 暴力点击 (Native JS Click)
+                // 这不会被任何 overlay 拦截
+                cb.click();
+                results.push(title);
             }
-            return items;
-        }''')
-
-        selected = []
-        selected_count = 0
-        
-        # Playwright locator 指向所有 checkbox
-        all_checkboxes = self.page.locator("[role='checkbox']")
-        
-        for item in candidates:
-            if selected_count >= n:
-                break
-                
-            title = item['title']
             
-            # 黑名单过滤
-            if title in exclude_titles:
-                continue
-                
-            try:
-                # 使用 nth(index) 定位
-                cb = all_checkboxes.nth(item['index'])
-                
-                # 确保元素在视口内 (Playwright click 会自动滚动，但有时候需要强制)
-                # await cb.scroll_into_view_if_needed()
-                
-                # 点击
-                await cb.click(timeout=2000)
-                
-                # 简单的验证：虽然我们不能立即确认 aria-checked 变了（有动画延迟），
-                # 但只要不报错，我们就假设点击成功了。
-                # 下一轮循环或者导出前的检查会处理异常情况。
-                
-                selected.append(title)
-                selected_count += 1
-                print(f"      ✓ [{selected_count}] {title}")
-                
-            except Exception as e:
-                print(f"      ⚠️ 点击失败 [{title}]: {e}")
+            return results;
+        }''', {'n': n, 'excludeList': exclude_list})
+
+        # 打印结果
+        for i, title in enumerate(selected_titles):
+            print(f"      ✓ [JS点击] {title}")
         
-        return selected_count, selected
+        # 给 UI 一点时间反应 (很重要，否则立即点击导出可能还没生效)
+        if selected_titles:
+            await asyncio.sleep(1.0)
+
+        return len(selected_titles), selected_titles
 
     async def export_all(self) -> list:
         """
