@@ -34,7 +34,7 @@ except ImportError:
 CHROME_DEBUG_PORT = 9222
 OUTPUT_DIR = "youtube_exports"
 DOWNLOADS_DIR = os.path.join(OUTPUT_DIR, "downloads")
-MAX_VIDEOS_PER_EXPORT = 12
+MAX_VIDEOS_PER_EXPORT = 6  # 每次6个，更好监控
 MAX_EXPORT_ROUNDS = 100
 # ==============================================
 
@@ -231,33 +231,25 @@ class YouTubeExporter:
         return selected_count
     
     async def unselect_all(self):
-        """取消所有勾选 - 使用 JavaScript 直接操作"""
-        for attempt in range(5):  # 最多尝试5轮
-            # 用 JS 找出所有已勾选的并取消
-            result = await self.page.evaluate(r'''() => {
-                const allCheckboxes = document.querySelectorAll("[role='checkbox']");
-                let uncheckedCount = 0;
-                
-                for (const cb of allCheckboxes) {
-                    if (cb.getAttribute("aria-checked") === "true") {
-                        cb.click();
-                        uncheckedCount++;
-                    }
-                }
-                
-                return uncheckedCount;
-            }''')
+        """取消所有勾选 - 使用 Playwright locator"""
+        for attempt in range(3):
+            checkboxes = self.page.locator("[role='checkbox'][aria-checked='true']")
+            count = await checkboxes.count()
             
-            if result == 0:
+            if count == 0:
                 break
             
-            print(f"      取消了 {result} 个勾选...")
-            await asyncio.sleep(0.5)
-        
-        # 验证
-        final_count = await self.count_checked()
-        if final_count > 0:
-            print(f"      ⚠️ 仍有 {final_count} 个被勾选")
+            print(f"      取消 {count} 个勾选...")
+            for i in range(count):
+                try:
+                    cb = checkboxes.nth(i)
+                    if await cb.is_visible():
+                        await cb.click()
+                        await asyncio.sleep(0.2)
+                except:
+                    pass
+            
+            await asyncio.sleep(0.3)
     
     async def scroll_down_once(self) -> int:
         """向下滚动一次，返回当前视频数量"""
@@ -433,56 +425,69 @@ class YouTubeExporter:
             await self.page.keyboard.press("Escape")
             return None
     
-    async def select_first_n_unchecked(self, n: int = 12) -> tuple:
+    async def select_first_n_unchecked(self, n: int = 6) -> tuple:
         """
-        直接用 JavaScript 勾选当前页面前 N 个未勾选的视频
+        用 Playwright locator 点击前 N 个未勾选的视频 checkbox
         返回 (成功数量, 视频标题列表)
         """
-        result = await self.page.evaluate(r'''(maxCount) => {
-            const allCheckboxes = document.querySelectorAll("[role='checkbox']");
-            const selected = [];
-            let count = 0;
-            
-            for (const cb of allCheckboxes) {
-                if (count >= maxCount) break;
-                
-                const rect = cb.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
-                
-                // 跳过已勾选的
-                if (cb.getAttribute("aria-checked") === "true") continue;
-                
-                // 找父行获取文本
-                let row = cb;
-                let text = "";
-                for (let i = 0; i < 10 && row; i++) {
-                    row = row.parentElement;
-                    if (row && row.innerText && row.innerText.length > 10) {
-                        text = row.innerText;
-                        break;
-                    }
-                }
-                
-                // 跳过"合计"行
-                if (text.includes("合计") || text.includes("Total")) continue;
-                
-                // 必须有时长（视频行特征）
-                if (!text.match(/\d:\d\d/)) continue;
-                
-                // 点击勾选
-                cb.click();
-                
-                // 验证是否勾选成功
-                if (cb.getAttribute("aria-checked") === "true") {
-                    count++;
-                    selected.push(text.substring(0, 40).replace(/\n/g, " "));
-                }
-            }
-            
-            return { count: count, videos: selected };
-        }''', n)
+        # 找所有 checkbox
+        checkboxes = self.page.locator("[role='checkbox']")
+        count = await checkboxes.count()
         
-        return result.get('count', 0), result.get('videos', [])
+        selected = []
+        selected_count = 0
+        
+        for i in range(count):
+            if selected_count >= n:
+                break
+            
+            cb = checkboxes.nth(i)
+            
+            try:
+                # 检查是否可见
+                if not await cb.is_visible():
+                    continue
+                
+                # 获取父行文本
+                parent = cb.locator("xpath=ancestor::*[string-length(normalize-space()) > 20][1]")
+                text = ""
+                try:
+                    text = await parent.inner_text(timeout=500)
+                except:
+                    pass
+                
+                # 跳过合计行
+                if "合计" in text or "Total" in text:
+                    continue
+                
+                # 必须是视频行（有时长）
+                import re
+                if not re.search(r'\d:\d\d', text):
+                    continue
+                
+                # 检查是否已勾选
+                checked = await cb.get_attribute("aria-checked")
+                if checked == "true":
+                    continue
+                
+                # 用 Playwright 点击（最可靠的方式）
+                await cb.click()
+                await asyncio.sleep(0.3)
+                
+                # 验证点击后状态
+                new_checked = await cb.get_attribute("aria-checked")
+                if new_checked == "true":
+                    selected_count += 1
+                    title = text.split('\n')[0][:40] if text else f"视频{i}"
+                    selected.append(title)
+                    print(f"      ✓ [{selected_count}] {title}")
+                else:
+                    print(f"      ✗ 点击无效: {text[:30]}")
+                    
+            except Exception as e:
+                continue
+        
+        return selected_count, selected
 
     async def export_all(self) -> list:
         """
